@@ -11,8 +11,8 @@ import pandas as pd
 from datetime import datetime, timedelta
 import io
 
-aws_access_key_id="minio"
-aws_secret_access_key="minio123"
+aws_access_key_id="admin"
+aws_secret_access_key="password"
 
 s3 = boto3.client('s3', endpoint_url="http://minio:9000", aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, config=Config(signature_version='s3v4'))
 
@@ -155,9 +155,9 @@ dag = DAG(
     dag_id = "3_gold_layer_processing",
     default_args = {
         "owner" : "Prabakar",
-        "start_date" : airflow.utils.dates.days_ago(1),
+        "start_date" : datetime.now() - timedelta(days=1),
     },
-    schedule_interval = "@yearly",
+    schedule = "@yearly",
     catchup = False
 )
 
