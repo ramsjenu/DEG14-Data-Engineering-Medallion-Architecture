@@ -1,178 +1,180 @@
-import airflow
+import io
+import json
+import pandas as pd
+from datetime import datetime, timedelta
+from pathlib import Path
+from kafka import KafkaConsumer
+import boto3
+from botocore.client import Config
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from kafka import KafkaConsumer
-import json
-from pathlib import Path
-import boto3
-from botocore.client import Config
-import pandas as pd
-from datetime import datetime, timedelta
-import io
 
-aws_access_key_id="admin"
-aws_secret_access_key="password"
+# ---------------------------------------------------------------------
+# Utility Functions
+# ---------------------------------------------------------------------
 
-s3 = boto3.client('s3', endpoint_url="http://minio:9000", aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, config=Config(signature_version='s3v4'))
+def get_s3_client():
+    """Return a boto3 S3 client configured for MinIO."""
+    return boto3.client(
+        "s3",
+        endpoint_url="http://minio:9000",
+        aws_access_key_id="admin",
+        aws_secret_access_key="password",
+        config=Config(signature_version="s3v4"),
+    )
 
-def get_buckets_list():
-    bucket_list = []
-    response = s3.list_buckets()
-    if 'Buckets' in response:
-        for bucket in response['Buckets']:
-            bucket_list.append(bucket['Name'])
-        return bucket_list
-    else:
-        print("No buckets found.")
-        return None        
 
-# List all objects inside the bucket
 def list_objects_in_bucket(bucket):
-    file_list = []
+    """List all objects in a given bucket."""
+    s3 = get_s3_client()
     response = s3.list_objects_v2(Bucket=bucket)
-    if 'Contents' in response:
-        for obj in response['Contents']:
+    file_list = []
+
+    if "Contents" in response:
+        for obj in response["Contents"]:
             print(f"Bucket: {bucket} Object: {obj['Key']}")
-            file_list.append(obj['Key'])
-        return file_list
+            file_list.append(obj["Key"])
     else:
         print(f"No objects found in {bucket}")
-        return file_list
+    return file_list
+
 
 def check_folder_and_create(bucket, file_name):
+    """Check if a file exists in a bucket."""
     bucket_obj_list = list_objects_in_bucket(bucket)
-
     for bucket_objs in bucket_obj_list:
-        if file_name not in bucket_objs:
-            pass
-        else:
-            print(f"{file_name} already exist")
+        if file_name in bucket_objs:
+            print(f"{file_name} already exists in {bucket}")
             return True
     return False
 
-# Create a folder (S3 treats folders as objects with '/' at the end)
-def create_folder(bucket, folder_name):
-    folder_key = f"{folder_name}/"
-    s3.put_object(Bucket=bucket, Key=folder_key)
-    print(f"Folder '{folder_name}' created successfully.")
 
 def convert_timestamps(df):
-    # Convert pickup and dropoff timestamps from milliseconds to datetime
-    df['tpep_pickup_datetime'] = pd.to_datetime(df['tpep_pickup_datetime'], unit='ms')
-    df['tpep_dropoff_datetime'] = pd.to_datetime(df['tpep_dropoff_datetime'], unit='ms')
+    """Convert pickup and dropoff timestamps from milliseconds to datetime."""
+    df["tpep_pickup_datetime"] = pd.to_datetime(df["tpep_pickup_datetime"], unit="ms")
+    df["tpep_dropoff_datetime"] = pd.to_datetime(df["tpep_dropoff_datetime"], unit="ms")
     return df
+
 
 def clean_data(df):
-    # Fill missing numerical values with the median or other relevant strategy
-    df['RatecodeID'].fillna(df['RatecodeID'].median(), inplace=True)
-    df['passenger_count'].fillna(df['passenger_count'].median(), inplace=True)
-    df['payment_type'].fillna(df['payment_type'].mode()[0], inplace=True)  # Use mode for categorical data
-    df['congestion_surcharge'].fillna(0, inplace=True)  # Fill congestion surcharge with 0 (default assumption)
-
-    # Fill missing categorical values with the most frequent value or a default
-    df['store_and_fwd_flag'].fillna('N', inplace=True)  # Assuming 'N' (no store and forward) is a safe default
-
-    # Drop any duplicates that may have been introduced
+    """Clean and standardize data."""
+    df["RatecodeID"].fillna(df["RatecodeID"].median(), inplace=True)
+    df["passenger_count"].fillna(df["passenger_count"].median(), inplace=True)
+    df["payment_type"].fillna(df["payment_type"].mode()[0], inplace=True)
+    df["congestion_surcharge"].fillna(0, inplace=True)
+    df["store_and_fwd_flag"].fillna("N", inplace=True)
     df.drop_duplicates(inplace=True)
-
-    # Ensure there are no remaining missing values
-    df.fillna(0, inplace=True)  # Final fallback to fill any remaining NaNs with 0 (for numeric columns)
-    df = convert_timestamps(df)
-    return df
+    df.fillna(0, inplace=True)
+    return convert_timestamps(df)
 
 
 def push_data_to_silver_layer(bucket_name, file_path):
-    # List objects in the bucket
+    """Process all parquet files in the bronze layer and upload cleaned versions to silver."""
+    s3 = get_s3_client()
     response = s3.list_objects_v2(Bucket=bucket_name)
 
-    # Loop over the objects
-    if 'Contents' in response:
-        for obj in response['Contents']:
-            object_name = obj['Key']
-            print(f"Found: {object_name} in {bucket_name}")
+    if "Contents" not in response:
+        print(f"No objects found in {bucket_name}")
+        return
 
-            if 'data' in object_name:
-                # Generate a presigned URL for downloading the object
-                url = s3.generate_presigned_url(
-                    'get_object',
-                    Params={
-                        'Bucket': bucket_name,
-                        'Key': object_name
-                    },
-                    ExpiresIn=3600  # URL expires in 1 hour
-                )
+    for obj in response["Contents"]:
+        object_name = obj["Key"]
 
-                # Read the parquet file using the URL
-                data = pd.read_parquet(url)
-                print(f"Reading: {object_name}")
+        # Only process relevant files
+        if "data" not in object_name:
+            continue
 
+        print(f"Processing {object_name} from {bucket_name}")
 
-                cleaned_data = clean_data(data)
-                
-                cleaned_data = cleaned_data.to_parquet()
-                data_stream = io.BytesIO(cleaned_data)  
-                
-                s3.put_object(
-                    Bucket='silver',
-                    Key=f"{object_name}",
-                    Body=data_stream,
-                    ContentType='application/json'
-                )
+        # Download object into memory (BytesIO)
+        file_stream = io.BytesIO()
+        s3.download_fileobj(bucket_name, object_name, file_stream)
+        file_stream.seek(0)
 
-                print(f"Uploaded {object_name} to S3.")
+        # Read parquet into DataFrame
+        df = pd.read_parquet(file_stream)
+        print(f"Loaded {len(df)} rows from {object_name}")
+
+        # Clean and transform data
+        cleaned_df = clean_data(df)
+
+        # Convert back to Parquet in memory
+        output_stream = io.BytesIO()
+        cleaned_df.to_parquet(output_stream, index=False)
+        output_stream.seek(0)
+
+        # Upload cleaned data to the silver bucket
+        s3.put_object(
+            Bucket="silver",
+            Key=f"{object_name}",
+            Body=output_stream.getvalue(),
+            ContentType="application/octet-stream",
+        )
+
+        print(f"✅ Uploaded cleaned {object_name} to silver layer.")
 
 
 def consume_data():
-    # Initialize Kafka consumer
+    """Consume Kafka messages and process new bronze files."""
     consumer = KafkaConsumer(
-        'bronze_layer_data',
-        bootstrap_servers=['broker:9092'],
-        auto_offset_reset='earliest',
+        "bronze_layer_data",
+        bootstrap_servers=["broker:9092"],
+        auto_offset_reset="earliest",
         enable_auto_commit=True,
-        value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+        value_deserializer=lambda x: json.loads(x.decode("utf-8")),
     )
-       
+
     for message in consumer:
         data = message.value
-        
-        if 'Key' in data:
-            print(f"Processing Key: {data['Key']}")
-            file_name = Path(data['Key']).stem
+        print(f"Received message: {data}")
 
-            if not check_folder_and_create(bucket="silver", file_name=file_name):
-                push_data_to_silver_layer("bronze", data["Key"])
-            else:
-                print("File already exists in the silver layer.")
+        if "Key" not in data:
+            print("Key not found in message; skipping.")
+            continue
+
+        file_name = Path(data["Key"]).stem
+        print(f"Processing file: {file_name}")
+
+        # Check if file already exists in the silver bucket
+        if not check_folder_and_create(bucket="silver", file_name=file_name):
+            push_data_to_silver_layer("bronze", data["Key"])
         else:
-            print(f"Key not found in message: {data}")
+            print(f"{file_name} already exists in silver layer.")
 
-dag = DAG(
-    dag_id = "2_silver_layer_processing",
-    default_args = {
-        "owner" : "Prabakar",
-        "start_date" : datetime.now() - timedelta(days=1),
-    },
-    schedule = "@yearly",
-    catchup = False
-)
 
-start = PythonOperator(
-    task_id = "start",
-    python_callable = lambda: print("Jobs Started"),
-    dag=dag
-)
+# ---------------------------------------------------------------------
+# Airflow DAG Definition
+# ---------------------------------------------------------------------
 
-silver_data_consumer = PythonOperator(
-    task_id="silver_data_consumer",
-    python_callable=consume_data,
-    dag=dag
-)
+default_args = {
+    "owner": "Prabakar",
+    "start_date": datetime(2025, 10, 5),
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
 
-end = PythonOperator(
-    task_id="end",
-    python_callable = lambda: print("Jobs completed successfully"),
-    dag=dag
-)
+with DAG(
+    dag_id="silver_layer_batch_processing",
+    default_args=default_args,
+    schedule="@yearly",
+    catchup=False,
+    tags=["silver", "data-pipeline"],
+) as dag:
 
-start >> silver_data_consumer >> end
+    start = PythonOperator(
+        task_id="start",
+        python_callable=lambda: print("🚀 Silver layer processing started"),
+    )
+
+    process_bronze_files = PythonOperator(
+        task_id="process_bronze_files",
+        python_callable=consume_data,
+    )
+
+    end = PythonOperator(
+        task_id="end",
+        python_callable=lambda: print("✅ Silver layer processing completed successfully"),
+    )
+
+    start >> process_bronze_files >> end

@@ -1,182 +1,152 @@
-import airflow
+import io
+import time
+import pandas as pd
+from datetime import datetime, timedelta
+import boto3
+from botocore.client import Config
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from kafka import KafkaConsumer
-import json
-from pathlib import Path
-import boto3
-from botocore.client import Config
-import pandas as pd
-from datetime import datetime, timedelta
-import io
 
-aws_access_key_id="admin"
-aws_secret_access_key="password"
+# ---------------------------------------------------------------------
+# Utility Functions
+# ---------------------------------------------------------------------
 
-s3 = boto3.client('s3', endpoint_url="http://minio:9000", aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, config=Config(signature_version='s3v4'))
-
-def get_buckets_list():
-    bucket_list = []
-    response = s3.list_buckets()
-    if 'Buckets' in response:
-        for bucket in response['Buckets']:
-            bucket_list.append(bucket['Name'])
-        return bucket_list
-    else:
-        print("No buckets found.")
-        return None        
-
-# List all objects inside the bucket
-def list_objects_in_bucket(bucket):
-    file_list = []
-    response = s3.list_objects_v2(Bucket=bucket)
-    if 'Contents' in response:
-        for obj in response['Contents']:
-            print(f"Bucket: {bucket} Object: {obj['Key']}")
-            file_list.append(obj['Key'])
-        return file_list
-    else:
-        print(f"No objects found in {bucket}")
-        return file_list
-
-def check_folder(bucket, file_name):
-    bucket_obj_list = list_objects_in_bucket(bucket)
-
-    for bucket_objs in bucket_obj_list:
-        if file_name not in bucket_objs:
-            pass
-        else:
-            print(f"{file_name} already exist")
-            return True
-    return False
-
-# Create a folder (S3 treats folders as objects with '/' at the end)
-def create_folder(bucket, folder_name):
-    folder_key = f"{folder_name}/"
-    s3.put_object(Bucket=bucket, Key=folder_key)
-    print(f"Folder '{folder_name}' created successfully.")
-
-def convert_timestamps(df):
-    # Convert pickup and dropoff timestamps from milliseconds to datetime
-    df['tpep_pickup_datetime'] = pd.to_datetime(df['tpep_pickup_datetime'], unit='ms')
-    df['tpep_dropoff_datetime'] = pd.to_datetime(df['tpep_dropoff_datetime'], unit='ms')
-    return df
-
-def clean_data(df):
-    # Fill missing numerical values with the median or other relevant strategy
-    df['RatecodeID'].fillna(df['RatecodeID'].median(), inplace=True)
-    df['passenger_count'].fillna(df['passenger_count'].median(), inplace=True)
-    df['payment_type'].fillna(df['payment_type'].mode()[0], inplace=True)  # Use mode for categorical data
-    df['congestion_surcharge'].fillna(0, inplace=True)  # Fill congestion surcharge with 0 (default assumption)
-
-    # Fill missing categorical values with the most frequent value or a default
-    df['store_and_fwd_flag'].fillna('N', inplace=True)  # Assuming 'N' (no store and forward) is a safe default
-
-    # Drop any duplicates that may have been introduced
-    df.drop_duplicates(inplace=True)
-
-    # Ensure there are no remaining missing values
-    df.fillna(0, inplace=True)  # Final fallback to fill any remaining NaNs with 0 (for numeric columns)
-    df = convert_timestamps(df)
-    return df
-
-
-def push_data_to_silver_layer(bucket_name, file_path):
-    # List objects in the bucket
-    response = s3.list_objects_v2(Bucket=bucket_name)
-
-    # Loop over the objects
-    if 'Contents' in response:
-        for obj in response['Contents']:
-            object_name = obj['Key']
-            print(f"Found: {object_name} in {bucket_name}")
-
-            if 'data' in object_name:
-                # Generate a presigned URL for downloading the object
-                url = s3.generate_presigned_url(
-                    'get_object',
-                    Params={
-                        'Bucket': bucket_name,
-                        'Key': object_name
-                    },
-                    ExpiresIn=3600  # URL expires in 1 hour
-                )
-
-                # Read the parquet file using the URL
-                data = pd.read_parquet(url)
-                print(f"Reading: {object_name}")
-
-                for index, row in data.iterrows():
-                    vendor_id = str(row['VendorID'])
-                    pickup_datetime = str(row['tpep_pickup_datetime'])
-                    folder_name = pickup_datetime.split(" ")[0]
-                    
-                    pickup_datetime_formated = pickup_datetime.replace(":", "-").replace(" ", "_")
-                    file_name = f"trip_{vendor_id}_{pickup_datetime_formated}.json"
-
-                    # Convert the row to JSON
-                    record = row.to_json()
-                    record_bytes = record.encode('utf-8')
-                    record_stream = io.BytesIO(record_bytes)
-
-                    # Upload the JSON data to a new S3 bucket
-                    s3.put_object(
-                        Bucket='gold',
-                        Key=f"{Path(folder_name).stem}/{file_name}",
-                        Body=record_stream,
-                        ContentType='application/json'
-                    )
-
-                    print(f"Uploaded {file_name} to S3.")
-
-
-def consume_data():
-    # Initialize Kafka consumer
-    consumer = KafkaConsumer(
-        'silver_layer_data',
-        bootstrap_servers=['broker:9092'],
-        auto_offset_reset='earliest',
-        enable_auto_commit=True,
-        value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+def get_s3_client():
+    """Return a boto3 S3 client configured for MinIO."""
+    return boto3.client(
+        "s3",
+        endpoint_url="http://minio:9000",
+        aws_access_key_id="admin",
+        aws_secret_access_key="password",
+        config=Config(signature_version="s3v4"),
     )
-       
-       
-    for message in consumer:
-        data = message.value
-        if 'Key' in data:
-            file_name = Path(data['Key']).stem
-            push_data_to_silver_layer("silver", data["Key"])
-        else:
-            print("Key not found in message.")
-        
-        
-dag = DAG(
-    dag_id = "3_gold_layer_processing",
-    default_args = {
-        "owner" : "Prabakar",
-        "start_date" : datetime.now() - timedelta(days=1),
-    },
-    schedule = "@yearly",
-    catchup = False
-)
 
-start = PythonOperator(
-    task_id = "start",
-    python_callable = lambda: print("Jobs Started"),
-    dag=dag
-)
 
-gold_data_consumer = PythonOperator(
-    task_id="gold_data_consumer",
-    python_callable=consume_data,
-    dag=dag
-)
+def list_objects_in_bucket(bucket):
+    """List all objects in a given S3 bucket."""
+    s3 = get_s3_client()
+    response = s3.list_objects_v2(Bucket=bucket)
+    if "Contents" in response:
+        return [obj["Key"] for obj in response["Contents"]]
+    else:
+        return []
 
-end = PythonOperator(
-    task_id="end",
-    python_callable = lambda: print("Jobs completed successfully"),
-    dag=dag
-)
 
-start >> gold_data_consumer >> end
+def ensure_bucket_exists(bucket_name):
+    """Ensure target bucket exists."""
+    s3 = get_s3_client()
+    try:
+        s3.create_bucket(Bucket=bucket_name)
+        print(f"✅ Bucket '{bucket_name}' created.")
+    except s3.exceptions.BucketAlreadyOwnedByYou:
+        pass
+    except Exception as e:
+        print(f"⚠️ Could not create bucket '{bucket_name}': {e}")
+
+
+# ---------------------------------------------------------------------
+# Core Gold Logic (Streaming Style)
+# ---------------------------------------------------------------------
+
+def write_partitioned_gold(df, gold_bucket):
+    """Write data partitioned by date into the gold bucket."""
+    s3 = get_s3_client()
+
+    df["date"] = df["tpep_pickup_datetime"].dt.date
+
+    for date_val, group_df in df.groupby("date"):
+        folder_path = f"date={date_val}"
+        print(f"📦 Writing data for {folder_path} ({len(group_df)} rows)")
+
+        output_stream = io.BytesIO()
+        group_df.to_parquet(output_stream, index=False)
+        output_stream.seek(0)
+
+        key = f"{folder_path}/part-{int(datetime.utcnow().timestamp())}.parquet"
+
+        s3.put_object(
+            Bucket=gold_bucket,
+            Key=key,
+            Body=output_stream.getvalue(),
+            ContentType="application/octet-stream",
+        )
+        print(f"✅ Uploaded {key} to {gold_bucket}")
+
+
+def gold_streaming_job():
+    """Continuously process new silver data into gold layer."""
+    s3 = get_s3_client()
+    silver_bucket = "silver"
+    gold_bucket = "gold"
+
+    ensure_bucket_exists(gold_bucket)
+    processed_files = set()  # to track what’s already processed
+
+    print("♻️ Gold streaming job started... continuously watching silver layer.")
+
+    while True:
+        silver_files = list_objects_in_bucket(silver_bucket)
+        if not silver_files:
+            print("⏳ No silver files found yet, waiting 15s...")
+            time.sleep(15)
+            continue
+
+        for key in silver_files:
+            if not key.endswith(".parquet"):
+                continue
+            if key in processed_files:
+                continue  # skip already processed
+
+            print(f"📥 New silver file detected: {key}")
+            file_stream = io.BytesIO()
+            s3.download_fileobj(silver_bucket, key, file_stream)
+            file_stream.seek(0)
+
+            df = pd.read_parquet(file_stream)
+            df["tpep_pickup_datetime"] = pd.to_datetime(df["tpep_pickup_datetime"])
+
+            # Write partitioned output
+            write_partitioned_gold(df, gold_bucket)
+
+            processed_files.add(key)
+            print(f"✅ {key} processed successfully to gold.")
+
+        print("🔁 Checking for new files again in 30s...")
+        time.sleep(30)  # polling interval
+
+
+# ---------------------------------------------------------------------
+# Airflow DAG Definition
+# ---------------------------------------------------------------------
+
+default_args = {
+    "owner": "Prabakar",
+    "start_date": datetime(2025, 10, 5),
+    "retries": 0,
+}
+
+with DAG(
+    dag_id="gold_layer_streaming",
+    default_args=default_args,
+    schedule=None,  # no cron, runs continuously
+    catchup=False,
+    tags=["gold", "streaming", "data-pipeline"],
+) as dag:
+
+    start = PythonOperator(
+        task_id="start",
+        python_callable=lambda: print("🚀 Gold layer streaming started"),
+    )
+
+    gold_consumer = PythonOperator(
+        task_id="gold_consumer",
+        python_callable=gold_streaming_job,
+    )
+
+    end = PythonOperator(
+        task_id="end",
+        python_callable=lambda: print("✅ Gold layer streaming ended"),
+    )
+
+    start >> gold_consumer >> end
